@@ -279,6 +279,11 @@ def step5_filter():
             base = base[base[col].map(row_match)]
 
         st.session_state["filtered_table"] = base
+        # reset quota bins when filtered_table changes; keep only quotas still present
+        existing_quota = st.session_state.get("filtered_quota_cols", [])
+        kept_quota = [c for c in existing_quota if c in base.columns]
+        st.session_state["filtered_quota_cols"] = kept_quota
+        st.session_state["filtered_table_with_bins"] = None
         st.success(f"filtered_table built: {len(base)} rows × {base.shape[1]} columns")
         show_df(base, 30)
         st.download_button(
@@ -301,12 +306,12 @@ def step5_filter():
             """
         )
         id_col = resp_col if resp_col in ft.columns else ft.columns[0]
-        available_cols = [c for c in df_full.columns if c != id_col and c not in ft.columns]
+        available_cols = [c for c in df_full.columns if c != id_col]
         if not available_cols:
-            st.info("No additional columns in df that are not already in filtered_table.")
+            st.info("No columns available (besides the ID).")
         else:
             extra_cols = st.multiselect(
-                "Extra columns to append",
+                "Columns to append (you can also re-select existing ones to treat them as quota columns)",
                 options=available_cols,
                 key="ft-extra-cols",
             )
@@ -314,21 +319,30 @@ def step5_filter():
                 if not extra_cols:
                     st.warning("Select at least one column to append.")
                 else:
-                    add_cols = [id_col] + extra_cols
-                    merged = ft.merge(
-                        df_full[add_cols].drop_duplicates(subset=id_col),
-                        on=id_col,
-                        how="left",
-                        suffixes=("", "_from_df"),
-                    )
-                    st.session_state["filtered_table"] = merged
+                    to_merge = [c for c in extra_cols if c not in ft.columns]
+                    merged = ft.copy()
+                    if to_merge:
+                        add_cols = [id_col] + to_merge
+                        merged = ft.merge(
+                            df_full[add_cols].drop_duplicates(subset=id_col),
+                            on=id_col,
+                            how="left",
+                            suffixes=("", "_from_df"),
+                        )
+                        st.session_state["filtered_table"] = merged
+                    else:
+                        st.session_state["filtered_table"] = merged
                     existing_quota = st.session_state.get("filtered_quota_cols", [])
                     for c in extra_cols:
                         if c not in existing_quota:
                             existing_quota.append(c)
                     st.session_state["filtered_quota_cols"] = existing_quota
+                    st.session_state["filtered_table_with_bins"] = None
+                    appended_count = len(to_merge)
+                    reused_count = len(extra_cols) - appended_count
                     st.success(
-                        f"Appended {len(extra_cols)} column(s). "
+                        f"Updated quotas | appended {appended_count} new column(s), "
+                        f"marked {reused_count} existing column(s). "
                         f"New filtered_table shape: {merged.shape}"
                     )
                     show_df(merged, 30)
@@ -337,77 +351,89 @@ def step5_filter():
     ft = st.session_state.get("filtered_table")
     quota_cols = st.session_state.get("filtered_quota_cols", [])
     if ft is not None and quota_cols:
-        st.markdown("#### 5.1.2 — Customize bins for quota columns (no change to filtered_table)")
-        st.markdown(
-            """
-            **What to do**
-            - Choose a quota column and define custom bins by selecting codes for each bin.
-            - Bins are stored in `filtered_table_with_bins` (the original `filtered_table` stays intact).
-            - You can apply bins to multiple quota columns one by one; click **Apply bins** after each column.
-            """
-        )
-        id_col = resp_col if resp_col in ft.columns else ft.columns[0]
-        base_ft = ft  # original values for allowed codes
-        ft_work = st.session_state.get("filtered_table_with_bins")
-        if ft_work is None:
-            ft_work = base_ft.copy()
-        col_to_bin = st.selectbox("Quota column to bin", quota_cols, key="ft-bin-col")
-        # display current binned info
-        if ft_work is not None:
-            st.caption(
-                f"Quota columns: {', '.join(quota_cols)} | "
-                f"Theoretical combinations (from bins): "
-                f"{int(pd.Series([ft_work[c].nunique(dropna=True) for c in quota_cols]).prod())} | "
-                f"Observed combinations in data: "
-                f"{int(ft_work[quota_cols].drop_duplicates().shape[0])}"
-            )
-        if col_to_bin:
-            vals = set()
-            for v in base_ft[col_to_bin].dropna():  # use original values for choices
-                vals.update(extract_codes_list(v))
-            vals = sorted(vals) if vals else []
-            num_bins = st.number_input(
-                "Number of bins", min_value=1, max_value=max(1, len(vals) or 10), value=2
-            )
+        # keep quota columns that exist in the current table and dedupe
+        filtered_quota = [c for c in quota_cols if c in ft.columns]
+        filtered_quota = list(dict.fromkeys(filtered_quota))
+        if filtered_quota != quota_cols:
+            st.session_state["filtered_quota_cols"] = filtered_quota
+        quota_cols = filtered_quota
+        if not quota_cols:
+            st.info("No quota columns found in the current filtered_table.")
+        else:
 
-            bin_defs = []
-            for i in range(int(num_bins)):
-                sel = st.multiselect(
-                    f"Bin {i+1} values",
-                    vals,
-                    key=f"ft-bin-{col_to_bin}-{i}",
+            st.markdown("#### 5.1.2 — Customize bins for quota columns (no change to filtered_table)")
+            st.markdown(
+                """
+                **What to do**
+                - Choose a quota column and define custom bins by selecting codes for each bin.
+                - Bins are stored in `filtered_table_with_bins` (the original `filtered_table` stays intact).
+                - You can apply bins to multiple quota columns one by one; click **Apply bins** after each column.
+                """
+            )
+            id_col = resp_col if resp_col in ft.columns else ft.columns[0]
+            base_ft = ft  # original values for allowed codes
+            ft_work = st.session_state.get("filtered_table_with_bins")
+            if ft_work is None:
+                ft_work = base_ft.copy()
+            col_to_bin = st.selectbox("Quota column to bin", quota_cols, key="ft-bin-col")
+            # display current binned info
+            if ft_work is not None:
+                st.caption(
+                    f"Quota columns: {', '.join(quota_cols)} | "
+                    f"Theoretical combinations (from bins): "
+                    f"{int(pd.Series([ft_work[c].nunique(dropna=True) for c in quota_cols]).prod())} | "
+                    f"Observed combinations in data: "
+                    f"{int(ft_work[quota_cols].drop_duplicates().shape[0])}"
                 )
-                bin_defs.append(set(int(x) for x in sel))
+            if col_to_bin:
+                vals = set()
+                for v in base_ft[col_to_bin].dropna():  # use original values for choices
+                    vals.update(extract_codes_list(v))
+                vals = sorted(vals) if vals else []
+                max_bins = max(1, len(vals) or 10)
+                default_bins = min(2, max_bins)
+                num_bins = st.number_input(
+                    "Number of bins", min_value=1, max_value=max_bins, value=default_bins
+                )
 
-            if st.button("Apply bins (filtered_table)"):
-                used = set()
-                ok = True
-                for b in bin_defs:
-                    if used & b:
-                        ok = False
-                        break
-                    used |= b
-                if not ok or not used:
-                    st.warning("Bins must be non-overlapping and not empty.")
-                else:
-                    code_to_bin = {}
-                    for idx, b in enumerate(bin_defs, start=1):
-                        for code in b:
-                            code_to_bin[code] = idx
+                bin_defs = []
+                for i in range(int(num_bins)):
+                    sel = st.multiselect(
+                        f"Bin {i+1} values",
+                        vals,
+                        key=f"ft-bin-{col_to_bin}-{i}",
+                    )
+                    bin_defs.append(set(int(x) for x in sel))
 
-                    def map_bin(v):
-                        codes = extract_codes_list(v)
-                        for c in codes:
-                            if c in code_to_bin:
-                                return code_to_bin[c]
-                        return None
+                if st.button("Apply bins (filtered_table)"):
+                    used = set()
+                    ok = True
+                    for b in bin_defs:
+                        if used & b:
+                            ok = False
+                            break
+                        used |= b
+                    if not ok or not used:
+                        st.warning("Bins must be non-overlapping and not empty.")
+                    else:
+                        code_to_bin = {}
+                        for idx, b in enumerate(bin_defs, start=1):
+                            for code in b:
+                                code_to_bin[code] = idx
 
-                    ft_bt = ft_work.copy()
-                    # always map from original base_ft values to allow re-binning the same column
-                    ft_bt[col_to_bin] = base_ft[col_to_bin].map(map_bin)
-                    st.session_state["filtered_table_with_bins"] = ft_bt
-                    st.success(f"Binning applied to '{col_to_bin}'.")
-                    show_df(ft_bt, 30)
+                        def map_bin(v):
+                            codes = extract_codes_list(v)
+                            for c in codes:
+                                if c in code_to_bin:
+                                    return code_to_bin[c]
+                            return None
+
+                        ft_bt = ft_work.copy()
+                        # always map from original base_ft values to allow re-binning the same column
+                        ft_bt[col_to_bin] = base_ft[col_to_bin].map(map_bin)
+                        st.session_state["filtered_table_with_bins"] = ft_bt
+                        st.success(f"Binning applied to '{col_to_bin}'.")
+                        show_df(ft_bt, 30)
 
     # 5.1.3 Sample evenly across quota-bin combinations --------------------
     ft_bt = st.session_state.get("filtered_table_with_bins")
@@ -687,8 +713,10 @@ def step5_matrix_solver():
             for v in it[col_to_bin].dropna():
                 vals.update(extract_codes_list(v))
             vals = sorted(vals) if vals else []
+            max_bins = max(1, len(vals) or 10)
+            default_bins = min(2, max_bins)
             num_bins = st.number_input(
-                "Number of bins", min_value=1, max_value=max(1, len(vals) or 10), value=2
+                "Number of bins", min_value=1, max_value=max_bins, value=default_bins
             )
 
             bin_defs = []
