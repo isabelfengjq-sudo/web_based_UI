@@ -1,0 +1,6 @@
+streamlit>=1.29
+pandas>=2.1
+openpyxl>=3.1
+numpy>=1.26
+pulp>=2.7
+matplotlib>=3.8
