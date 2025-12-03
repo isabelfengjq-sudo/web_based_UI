@@ -37,7 +37,7 @@ def init_state() -> None:
         st.session_state.setdefault(key, val)
 
 
-def show_df(df: pd.DataFrame, n: int = 30):
+def show_df(df: pd.DataFrame, n: int = 70):
     """Render a dataframe safely (cast object cols to string to avoid Arrow errors)."""
     if df is None:
         return
@@ -105,7 +105,7 @@ def step0_upload():
         )
 
     st.write("Preview (first 30 rows):")
-    show_df(df, 30)
+    show_df(df, 70)
     st.caption("Columns: " + ", ".join(df.columns.astype(str)))
 
 
@@ -214,7 +214,7 @@ def step4_raw_table():
         raw = left.merge(right, on=resp_col, how="left")
         st.session_state["raw_table"] = raw
         st.success(f"raw_table built with shape {raw.shape}")
-        show_df(raw, 30)
+        show_df(raw, 70)
 
 
 def step5_filter():
@@ -285,7 +285,7 @@ def step5_filter():
         st.session_state["filtered_quota_cols"] = kept_quota
         st.session_state["filtered_table_with_bins"] = None
         st.success(f"filtered_table built: {len(base)} rows × {base.shape[1]} columns")
-        show_df(base, 30)
+        show_df(base, 70)
         st.download_button(
             "Download filtered_table (CSV)",
             data=base.to_csv(index=False),
@@ -345,7 +345,7 @@ def step5_filter():
                         f"marked {reused_count} existing column(s). "
                         f"New filtered_table shape: {merged.shape}"
                     )
-                    show_df(merged, 30)
+                    show_df(merged, 70)
 
     # 5.1.2 Bin quota columns ----------------------------------------------
     ft = st.session_state.get("filtered_table")
@@ -433,7 +433,7 @@ def step5_filter():
                         ft_bt[col_to_bin] = base_ft[col_to_bin].map(map_bin)
                         st.session_state["filtered_table_with_bins"] = ft_bt
                         st.success(f"Binning applied to '{col_to_bin}'.")
-                        show_df(ft_bt, 30)
+                        show_df(ft_bt, 70)
 
     # 5.1.3 Sample evenly across quota-bin combinations --------------------
     ft_bt = st.session_state.get("filtered_table_with_bins")
@@ -482,7 +482,7 @@ def step5_filter():
                 st.success(f"Selected {len(result)} rows across {len(combo_to_rows)} combination(s).")
                 if warnings:
                     st.warning("\n".join(warnings))
-                show_df(result, 30)
+                show_df(result, len(result))
                 st.download_button(
                     "Download selected_rows_from_filtered_bins (CSV)",
                     data=result.to_csv(index=False),
@@ -495,17 +495,17 @@ def step5_filter():
     ft_now = st.session_state.get("filtered_table")
     if ft_now is not None:
         st.write(f"`filtered_table`: {ft_now.shape}")
-        show_df(ft_now, 20)
+        show_df(ft_now, 70)
 
     ft_bins_now = st.session_state.get("filtered_table_with_bins")
     if ft_bins_now is not None:
         st.write(f"`filtered_table_with_bins`: {ft_bins_now.shape}")
-        show_df(ft_bins_now, 20)
+        show_df(ft_bins_now, 70)
 
     sel_bins = st.session_state.get("selected_rows_from_filtered_bins")
     if sel_bins is not None:
         st.write(f"`selected_rows_from_filtered_bins`: {sel_bins.shape}")
-        show_df(sel_bins, 20)
+        show_df(sel_bins, len(sel_bins))
 
 
 def step5_mention():
@@ -567,7 +567,7 @@ def step5_mention():
             avg_df = pd.DataFrame({resp_col: ids, "Average": avgs})
             st.session_state["avg_num_of_times"] = avg_df
             st.success(f"avg_num_of_times built: {len(avg_df)} rows × 2 columns")
-            show_df(avg_df, 30)
+            show_df(avg_df, 70)
             st.download_button(
                 "Download avg_num_of_times (CSV)",
                 data=avg_df.to_csv(index=False),
@@ -595,7 +595,7 @@ def step5_mention():
         st.session_state["avg_bins"] = avg_bins[["Average", resp_col, "Bin"]]
 
         st.write("Respondent bin assignment (first 30 rows):")
-        st.dataframe(avg_bins[[resp_col, "Average", "Bin"]].head(30))
+        st.dataframe(avg_bins[[resp_col, "Average", "Bin"]].head(70))
 
         counts = avg_bins["Bin"].value_counts().reindex(bin_labels).fillna(0).astype(int)
         st.write("Counts per bin:")
@@ -645,21 +645,41 @@ def step5_matrix_solver():
         code_opts,
         key="it-codes",
     )
+    st.caption("Use either the include list or the exclude list—not both.")
+    exclude_codes = st.multiselect(
+        "Code(s) that must NOT be present for a cell to be 1 (optional)",
+        code_opts,
+        key="it-exclude-codes",
+    )
 
     if st.button("Create inspected_table"):
-        if not target_codes:
-            st.warning("Pick at least one code.")
+        include_set = set(int(x) for x in target_codes)
+        exclude_set = set(int(x) for x in exclude_codes)
+        if include_set and exclude_set:
+            st.warning("Pick either required codes OR excluded codes, not both.")
+        elif not include_set and not exclude_set:
+            st.warning("Pick at least one code in either list.")
         else:
-            target_set = set(int(x) for x in target_codes)
             inspected = rt.copy()
+
+            if include_set:
+                def cell_fn(v):
+                    codes = set(extract_codes_list(v))
+                    return 1 if include_set.issubset(codes) else 0
+                mode_msg = f"require {sorted(include_set)}"
+            else:
+                def cell_fn(v):
+                    codes = set(extract_codes_list(v))
+                    return 1 if not (codes & exclude_set) else 0
+                mode_msg = f"exclude {sorted(exclude_set)}"
+
             for col in data_cols:
-                inspected[col] = inspected[col].map(
-                    lambda v: 1 if target_set.issubset(set(extract_codes_list(v))) else 0
-                )
+                inspected[col] = inspected[col].map(cell_fn)
+
             st.session_state["inspected_table"] = inspected
             st.session_state["inspected_table_with_bins"] = None
-            st.success(f"inspected_table created with shape {inspected.shape}")
-            st.dataframe(inspected.head(30))
+            st.success(f"inspected_table created ({mode_msg}) with shape {inspected.shape}")
+            st.dataframe(inspected.head(70))
             st.download_button(
                 "Download inspected_table (CSV)",
                 data=inspected.to_csv(index=False),
@@ -689,7 +709,7 @@ def step5_matrix_solver():
                 st.session_state["inspected_table"] = merged
                 st.session_state["inspected_quota_cols"] = extra
                 st.success(f"Added {len(extra)} column(s). New shape: {merged.shape}")
-                show_df(merged, 30)
+                show_df(merged, 70)
 
     # 5.3.2 Binning quota columns ------------------------------------------
     it = st.session_state.get("inspected_table")
@@ -755,7 +775,7 @@ def step5_matrix_solver():
                     bt[col_to_bin] = bt[col_to_bin].map(map_bin)
                     st.session_state["inspected_table_with_bins"] = bt
                     st.success(f"Binning applied to '{col_to_bin}'.")
-                    show_df(bt, 30)
+                    show_df(bt, 70)
 
     # 5.3.3 Solver ----------------------------------------------------------
     it_base = st.session_state.get("inspected_table")
@@ -838,7 +858,7 @@ def step5_matrix_solver():
                     st.success(f"Found solution with {len(sel_tbl)} rows.")
                     st.write("Selected respondent IDs:")
                     st.write(sel_tbl[id_col].tolist())
-                    show_df(sel_tbl, 30)
+                    show_df(sel_tbl, 70)
                     st.download_button(
                         "Download selected rows (CSV)",
                         data=sel_tbl.to_csv(index=False),
