@@ -39,7 +39,7 @@ def init_state() -> None:
         st.session_state.setdefault(key, val)
 
 
-def show_df(df: pd.DataFrame, n: int = 70):
+def show_df(df: pd.DataFrame, n: int = 150):
     """Render a dataframe safely (cast object cols to string to avoid Arrow errors)."""
     if df is None:
         return
@@ -107,7 +107,7 @@ def step0_upload():
         )
 
     st.write("Preview (first 30 rows):")
-    show_df(df, 70)
+    show_df(df, 150)
     st.caption("Columns: " + ", ".join(df.columns.astype(str)))
 
 
@@ -216,7 +216,7 @@ def step4_raw_table():
         raw = left.merge(right, on=resp_col, how="left")
         st.session_state["raw_table"] = raw
         st.success(f"raw_table built with shape {raw.shape}")
-        show_df(raw, 70)
+        show_df(raw, 150)
 
 
 def step5_filter():
@@ -287,7 +287,7 @@ def step5_filter():
         st.session_state["filtered_quota_cols"] = kept_quota
         st.session_state["filtered_table_with_bins"] = None
         st.success(f"filtered_table built: {len(base)} rows × {base.shape[1]} columns")
-        show_df(base, 70)
+        show_df(base, 150)
         st.download_button(
             "Download filtered_table (CSV)",
             data=st.session_state["filtered_table"].to_csv(index=False),
@@ -347,7 +347,7 @@ def step5_filter():
                         f"marked {reused_count} existing column(s). "
                         f"New filtered_table shape: {merged.shape}"
                     )
-                    show_df(merged, 70)
+                    show_df(merged, 150)
 
     # 5.1.2 Bin quota columns ----------------------------------------------
     ft = st.session_state.get("filtered_table")
@@ -435,7 +435,7 @@ def step5_filter():
                         ft_bt[col_to_bin] = base_ft[col_to_bin].map(map_bin)
                         st.session_state["filtered_table_with_bins"] = ft_bt
                         st.success(f"Binning applied to '{col_to_bin}'.")
-                        show_df(ft_bt, 70)
+                        show_df(ft_bt, 150)
 
     # 5.1.3 Sample evenly across quota-bin combinations --------------------
     ft_bt = st.session_state.get("filtered_table_with_bins")
@@ -497,12 +497,12 @@ def step5_filter():
     ft_now = st.session_state.get("filtered_table")
     if ft_now is not None:
         st.write(f"`filtered_table`: {ft_now.shape}")
-        show_df(ft_now, 70)
+        show_df(ft_now, 150)
 
     ft_bins_now = st.session_state.get("filtered_table_with_bins")
     if ft_bins_now is not None:
         st.write(f"`filtered_table_with_bins`: {ft_bins_now.shape}")
-        show_df(ft_bins_now, 70)
+        show_df(ft_bins_now, 150)
 
     sel_bins = st.session_state.get("selected_rows_from_filtered_bins")
     if sel_bins is not None:
@@ -569,7 +569,7 @@ def step5_mention():
             avg_df = pd.DataFrame({resp_col: ids, "Average": avgs})
             st.session_state["avg_num_of_times"] = avg_df
             st.success(f"avg_num_of_times built: {len(avg_df)} rows × 2 columns")
-            show_df(avg_df, 70)
+            show_df(avg_df, 150)
             st.download_button(
                 "Download avg_num_of_times (CSV)",
                 data=st.session_state["avg_num_of_times"].to_csv(index=False),
@@ -597,7 +597,7 @@ def step5_mention():
         st.session_state["avg_bins"] = avg_bins[["Average", resp_col, "Bin"]]
 
         st.write("Respondent bin assignment (first 30 rows):")
-        st.dataframe(avg_bins[[resp_col, "Average", "Bin"]].head(70))
+        st.dataframe(avg_bins[[resp_col, "Average", "Bin"]].head(150))
 
         counts = avg_bins["Bin"].value_counts().reindex(bin_labels).fillna(0).astype(int)
         st.write("Counts per bin:")
@@ -681,7 +681,7 @@ def step5_matrix_solver():
             st.session_state["inspected_table"] = inspected
             st.session_state["inspected_table_with_bins"] = None
             st.success(f"inspected_table created ({mode_msg}) with shape {inspected.shape}")
-            st.dataframe(inspected.head(70))
+            st.dataframe(inspected.head(150))
             st.download_button(
                 "Download inspected_table (CSV)",
                 data=st.session_state["inspected_table"].to_csv(index=False),
@@ -711,7 +711,7 @@ def step5_matrix_solver():
                 st.session_state["inspected_table"] = merged
                 st.session_state["inspected_quota_cols"] = extra
                 st.success(f"Added {len(extra)} column(s). New shape: {merged.shape}")
-                show_df(merged, 70)
+                show_df(merged, 150)
 
     # 5.3.2 Binning quota columns ------------------------------------------
     it = st.session_state.get("inspected_table")
@@ -777,7 +777,7 @@ def step5_matrix_solver():
                     bt[col_to_bin] = bt[col_to_bin].map(map_bin)
                     st.session_state["inspected_table_with_bins"] = bt
                     st.success(f"Binning applied to '{col_to_bin}'.")
-                    show_df(bt, 70)
+                    show_df(bt, 150)
 
     # 5.3.3 Solver ----------------------------------------------------------
     it_base = st.session_state.get("inspected_table")
@@ -860,7 +860,7 @@ def step5_matrix_solver():
                     st.success(f"Found solution with {len(sel_tbl)} rows.")
                     st.write("Selected respondent IDs:")
                     st.write(sel_tbl[id_col].tolist())
-                    show_df(sel_tbl, 70)
+                    show_df(sel_tbl, 150)
                     st.download_button(
                         "Download selected rows (CSV)",
                         data=sel_tbl.to_csv(index=False),
@@ -897,7 +897,7 @@ def tools_comparison():
         df_local = _read_bytes(file.name, file.getvalue())
         st.subheader(f"File {idx+1}: {file.name}")
         st.write(f"Shape: {df_local.shape}")
-        show_df(df_local, 70)
+        show_df(df_local, 150)
 
         id_col = st.selectbox(
             f"Respondent ID column — {file.name}",
