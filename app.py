@@ -1,4 +1,5 @@
 import pandas as pd
+from io import BytesIO
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -32,6 +33,7 @@ def init_state() -> None:
         "inspected_table_with_bins": None,
         "selected_rows_from_inspected": None,
         "inspected_quota_cols": [],
+        "comparison_results": None,
     }
     for key, val in defaults.items():
         st.session_state.setdefault(key, val)
@@ -288,7 +290,7 @@ def step5_filter():
         show_df(base, 70)
         st.download_button(
             "Download filtered_table (CSV)",
-            data=base.to_csv(index=False),
+            data=st.session_state["filtered_table"].to_csv(index=False),
             file_name="filtered_table.csv",
             mime="text/csv",
         )
@@ -485,7 +487,7 @@ def step5_filter():
                 show_df(result, len(result))
                 st.download_button(
                     "Download selected_rows_from_filtered_bins (CSV)",
-                    data=result.to_csv(index=False),
+                    data=st.session_state["selected_rows_from_filtered_bins"].to_csv(index=False),
                     file_name="selected_rows_from_filtered_bins.csv",
                     mime="text/csv",
                 )
@@ -570,7 +572,7 @@ def step5_mention():
             show_df(avg_df, 70)
             st.download_button(
                 "Download avg_num_of_times (CSV)",
-                data=avg_df.to_csv(index=False),
+                data=st.session_state["avg_num_of_times"].to_csv(index=False),
                 file_name="avg_num_of_times.csv",
                 mime="text/csv",
             )
@@ -618,7 +620,7 @@ def step5_mention():
 
         st.download_button(
             "Download avg_bins (CSV)",
-            data=avg_bins[[resp_col, "Average", "Bin"]].to_csv(index=False),
+            data=st.session_state["avg_bins"].to_csv(index=False),
             file_name="avg_bins.csv",
             mime="text/csv",
         )
@@ -682,7 +684,7 @@ def step5_matrix_solver():
             st.dataframe(inspected.head(70))
             st.download_button(
                 "Download inspected_table (CSV)",
-                data=inspected.to_csv(index=False),
+                data=st.session_state["inspected_table"].to_csv(index=False),
                 file_name="inspected_table.csv",
                 mime="text/csv",
             )
@@ -867,6 +869,107 @@ def step5_matrix_solver():
                     )
 
 
+def tools_comparison():
+    st.header("Tools: Comparison — Overlap by quota combinations")
+    st.caption(
+        "Upload 2+ tables, pick quota column(s) per table, and find overlapping respondent IDs per combination."
+    )
+
+    uploaded = st.file_uploader(
+        "Upload CSV or Excel files (2 or more)", type=["csv", "xlsx"], accept_multiple_files=True, key="cmp-uploader"
+    )
+
+    if not uploaded:
+        st.info("Upload at least two files to compare.")
+        return
+    if len(uploaded) < 2:
+        st.warning("Need at least two files for comparison.")
+        return
+
+    @st.cache_data(show_spinner=False)
+    def _read_bytes(name: str, data: bytes):
+        if name.lower().endswith(".csv"):
+            return pd.read_csv(BytesIO(data))
+        return pd.read_excel(BytesIO(data))
+
+    tables = []
+    for idx, file in enumerate(uploaded):
+        df_local = _read_bytes(file.name, file.getvalue())
+        st.subheader(f"File {idx+1}: {file.name}")
+        st.write(f"Shape: {df_local.shape}")
+        show_df(df_local, 70)
+
+        id_col = st.selectbox(
+            f"Respondent ID column — {file.name}",
+            options=list(df_local.columns),
+            index=list(df_local.columns).index(st.session_state["resp_col"]) if st.session_state["resp_col"] in df_local.columns else 0,
+            key=f"cmp-id-{idx}",
+        )
+        quota_cols = st.multiselect(
+            f"Quota column(s) for {file.name}",
+            options=[c for c in df_local.columns if c != id_col],
+            key=f"cmp-quota-{idx}",
+        )
+        tables.append({"name": file.name, "df": df_local, "id_col": id_col, "quota_cols": quota_cols})
+
+    if st.button("Run comparison"):
+        # validate quota columns
+        if any(not t["quota_cols"] for t in tables):
+            st.warning("Select at least one quota column for each table.")
+            return
+        # enforce common quota set
+        common_quota = set(tables[0]["quota_cols"])
+        for t in tables[1:]:
+            common_quota &= set(t["quota_cols"])
+        if not common_quota:
+            st.error("Quota columns must overlap across all tables. Pick at least one column present in every table.")
+            return
+        quota_cols = sorted(common_quota)
+
+        def combos_map(df, id_col, qcols):
+            base = df.dropna(subset=[id_col])
+            grp = base.groupby(qcols)[id_col].apply(lambda s: set(s.dropna())).to_dict()
+            return grp
+
+        all_combo_keys = set()
+        per_table_maps = []
+        for t in tables:
+            cmap = combos_map(t["df"], t["id_col"], quota_cols)
+            per_table_maps.append(cmap)
+            all_combo_keys.update(cmap.keys())
+
+        results = []
+        for combo in sorted(all_combo_keys):
+            combo_vals = list(combo) if isinstance(combo, tuple) else [combo]
+            ids_per_table = []
+            counts = {}
+            for t, cmap in zip(tables, per_table_maps):
+                ids = cmap.get(combo, set())
+                ids_per_table.append(ids)
+                counts[f"{t['name']} count"] = len(ids)
+            overlap = set.intersection(*ids_per_table) if ids_per_table else set()
+            row = {col: val for col, val in zip(quota_cols, combo_vals)}
+            row.update(counts)
+            row["overlap_count"] = len(overlap)
+            row["overlap_ids"] = sorted(overlap)
+            results.append(row)
+
+        if not results:
+            st.info("No combinations found across the uploaded tables.")
+            return
+
+        res_df = pd.DataFrame(results)
+        st.session_state["comparison_results"] = res_df
+        st.success(f"Built comparison across {len(tables)} table(s) and {len(results)} combination(s).")
+        show_df(res_df, len(res_df))
+        st.download_button(
+            "Download comparison (CSV)",
+            data=res_df.to_csv(index=False),
+            file_name="comparison_results.csv",
+            mime="text/csv",
+        )
+
+
 def main():
     init_state()
     tabs = st.tabs([
@@ -877,6 +980,7 @@ def main():
         "Step 5.1: Filter",
         "Step 5.2: Mention rate",
         "Step 5.3: Matrix & solver",
+        "Tools: Comparison",
     ])
     with tabs[0]:
         step0_upload()
@@ -892,6 +996,8 @@ def main():
         step5_mention()
     with tabs[6]:
         step5_matrix_solver()
+    with tabs[7]:
+        tools_comparison()
 
 
 if __name__ == "__main__":
