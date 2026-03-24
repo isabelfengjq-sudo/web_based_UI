@@ -1,5 +1,6 @@
 import pandas as pd
 from io import BytesIO
+import random
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -33,6 +34,7 @@ def init_state() -> None:
         "inspected_table_with_bins": None,
         "selected_rows_from_inspected": None,
         "inspected_quota_cols": [],
+        "step54_independent_samples": None,
         "comparison_results": None,
     }
     for key, val in defaults.items():
@@ -869,6 +871,151 @@ def step5_matrix_solver():
                     )
 
 
+def step5_independent_sampling():
+    st.header("Step 5.4 — Independent filter + random respondent IDs")
+    st.caption(
+        "Input is `raw_table` from Step 4. Each column runs independently (no AND combination across columns)."
+    )
+    rt = st.session_state["raw_table"]
+    resp_col = st.session_state["resp_col"]
+    if rt is None:
+        st.info("Run Step 4 first to build raw_table.")
+        return
+
+    id_col = resp_col if resp_col in rt.columns else rt.columns[0]
+    data_cols = [c for c in rt.columns if c != id_col]
+    if not data_cols:
+        st.warning("raw_table has no data columns besides the ID.")
+        return
+
+    def _allowed_vals(col: str):
+        vals = set()
+        for v in rt[col].dropna():
+            vals.update(extract_codes_list(v))
+        return sorted(vals) if vals else list(range(-100, 101))
+
+    with st.form("step5_4_independent_form"):
+        st.write("Set filter rule and random sample size for each column.")
+        jobs = []
+        for col in data_cols:
+            st.markdown(f"**{col}**")
+            op = st.selectbox(
+                f"{col} operator",
+                ["eq", "in", "mc", "nc"],
+                key=f"s54-op-{col}",
+            )
+            vals = _allowed_vals(col)
+            if op == "eq":
+                val = st.selectbox(f"{col} value", vals, key=f"s54-eq-{col}")
+                selected_vals = [int(val)] if val is not None else []
+            else:
+                selected_vals = st.multiselect(
+                    f"{col} values",
+                    vals,
+                    key=f"s54-vals-{col}",
+                )
+                selected_vals = [int(x) for x in selected_vals]
+
+            sample_n = st.number_input(
+                f"{col} random respondent count",
+                min_value=0,
+                value=0,
+                step=1,
+                key=f"s54-n-{col}",
+            )
+            jobs.append(
+                {
+                    "column": col,
+                    "op": op,
+                    "values": selected_vals,
+                    "sample_n": int(sample_n),
+                }
+            )
+        submitted = st.form_submit_button("Run independent filtering + random selection")
+
+    if submitted:
+        out_rows = []
+        notices = []
+        for job in jobs:
+            col = job["column"]
+            op = job["op"]
+            vals = job["values"]
+            sample_n = int(job["sample_n"])
+
+            if sample_n <= 0:
+                continue
+            if op != "eq" and not vals:
+                notices.append(f"{col}: skipped because no values were selected.")
+                continue
+
+            conditions = [{"column": col, "op": op, "values": vals}]
+            filtered_ids = select_ids_from_df(rt, conditions, respondent_col=id_col)
+
+            if not filtered_ids:
+                sampled_ids = []
+            elif sample_n >= len(filtered_ids):
+                sampled_ids = list(filtered_ids)
+                if sample_n > len(filtered_ids):
+                    notices.append(
+                        f"{col}: requested {sample_n}, but only {len(filtered_ids)} matched; returned all."
+                    )
+            else:
+                sampled_ids = random.sample(filtered_ids, sample_n)
+
+            out_rows.append(
+                {
+                    "Column": col,
+                    "Operator": op,
+                    "Values": ", ".join(str(x) for x in vals),
+                    "Requested_n": sample_n,
+                    "Matched_n": len(filtered_ids),
+                    "Selected_n": len(sampled_ids),
+                    "Selected_respondent_ids": sampled_ids,
+                }
+            )
+
+        if not out_rows:
+            st.session_state["step54_independent_samples"] = None
+            st.warning(
+                "No output produced. Set random respondent count > 0 for at least one column."
+            )
+            return
+
+        result = pd.DataFrame(out_rows)
+        st.session_state["step54_independent_samples"] = result
+        st.success(f"Generated outputs for {len(result)} column(s).")
+        if notices:
+            st.warning("\n".join(notices))
+
+        st.markdown("#### Selected respondent IDs by column")
+        for _, row in result.iterrows():
+            ids = row["Selected_respondent_ids"]
+            st.write(
+                f"{row['Column']} | {row['Operator']} [{row['Values']}] -> "
+                f"{row['Selected_n']} ID(s)"
+            )
+            if ids:
+                st.code("\n".join(str(x) for x in ids), language="text")
+            else:
+                st.code("(no matched IDs)", language="text")
+
+        downloadable = result.copy()
+        downloadable["Selected_respondent_ids"] = downloadable["Selected_respondent_ids"].map(
+            lambda xs: ",".join(str(x) for x in xs)
+        )
+        st.download_button(
+            "Download step5_4_selected_ids (CSV)",
+            data=downloadable.to_csv(index=False),
+            file_name="step5_4_selected_ids.csv",
+            mime="text/csv",
+        )
+
+    existing = st.session_state.get("step54_independent_samples")
+    if existing is not None and not existing.empty:
+        st.markdown("#### Latest Step 5.4 result")
+        show_df(existing, len(existing))
+
+
 def tools_comparison():
     st.header("Tools: Comparison — Overlap by quota combinations")
     st.caption(
@@ -980,6 +1127,7 @@ def main():
         "Step 5.1: Filter",
         "Step 5.2: Mention rate",
         "Step 5.3: Matrix & solver",
+        "Step 5.4: Independent sampling",
         "Tools: Comparison",
     ])
     with tabs[0]:
@@ -997,6 +1145,8 @@ def main():
     with tabs[6]:
         step5_matrix_solver()
     with tabs[7]:
+        step5_independent_sampling()
+    with tabs[8]:
         tools_comparison()
 
 
