@@ -872,11 +872,12 @@ def step5_matrix_solver():
 
 
 def step5_independent_sampling():
-    st.header("Step 5.4 — Independent filter + random respondent IDs")
+    st.header("Step 5.4 — Independent filter + random respondent IDs (with optional quota)")
     st.caption(
-        "Input is `raw_table` from Step 4. Each column runs independently (no AND combination across columns)."
+        "Input is `raw_table` from Step 4. Each target column runs independently (OR-style across columns)."
     )
     rt = st.session_state["raw_table"]
+    df_full = st.session_state.get("df")
     resp_col = st.session_state["resp_col"]
     if rt is None:
         st.info("Run Step 4 first to build raw_table.")
@@ -888,38 +889,150 @@ def step5_independent_sampling():
         st.warning("raw_table has no data columns besides the ID.")
         return
 
-    def _allowed_vals(col: str):
+    def _allowed_vals(df_in: pd.DataFrame, col: str):
         vals = set()
-        for v in rt[col].dropna():
+        for v in df_in[col].dropna():
             vals.update(extract_codes_list(v))
         return sorted(vals) if vals else list(range(-100, 101))
 
-    with st.form("step5_4_independent_form"):
-        st.write("Set filter rule and random sample size for each column.")
+    def _build_quota_table(ids: list, quota_cols: list[str]) -> pd.DataFrame:
+        base = pd.DataFrame({id_col: ids}).drop_duplicates(subset=id_col)
+        for qcol in quota_cols:
+            src = None
+            if qcol in rt.columns:
+                src = rt[[id_col, qcol]].drop_duplicates(subset=id_col)
+            elif df_full is not None and id_col in df_full.columns and qcol in df_full.columns:
+                src = df_full[[id_col, qcol]].drop_duplicates(subset=id_col)
+
+            if src is None:
+                base[qcol] = pd.NA
+            else:
+                base = base.merge(src, on=id_col, how="left")
+        return base
+
+    def _apply_bins(df_in: pd.DataFrame, quota_cols: list[str], bin_defs_map: dict) -> pd.DataFrame:
+        out = df_in.copy()
+        for qcol in quota_cols:
+            defs = bin_defs_map.get(qcol, [])
+            if not defs:
+                continue
+            code_to_bin = {}
+            for idx, codes in enumerate(defs, start=1):
+                for code in codes:
+                    code_to_bin[int(code)] = idx
+
+            def _map_one(v):
+                codes = extract_codes_list(v)
+                for c in codes:
+                    if c in code_to_bin:
+                        return code_to_bin[c]
+                return None
+
+            out[qcol] = out[qcol].map(_map_one)
+        return out
+
+    def _quota_aware_sample(df_ids_quota: pd.DataFrame, quota_cols: list[str], sample_n: int):
+        if sample_n <= 0 or df_ids_quota.empty:
+            return [], {}, {}
+        combo_series = df_ids_quota[quota_cols].apply(lambda row: tuple(row.tolist()), axis=1)
+        combo_to_ids = {}
+        for idx, combo in combo_series.items():
+            rid = df_ids_quota.at[idx, id_col]
+            combo_to_ids.setdefault(combo, [])
+            if rid not in combo_to_ids[combo]:
+                combo_to_ids[combo].append(rid)
+
+        combos = list(combo_to_ids.keys())
+        total_available = sum(len(v) for v in combo_to_ids.values())
+        target = min(sample_n, total_available)
+        if target <= 0:
+            return [], {}, {c: len(combo_to_ids[c]) for c in combos}
+
+        base_take = target // len(combos)
+        remainder = target % len(combos)
+        combo_order = combos.copy()
+        random.shuffle(combo_order)
+        desired = {c: base_take for c in combos}
+        for c in combo_order[:remainder]:
+            desired[c] += 1
+
+        pools = {}
+        selected_by_combo = {c: [] for c in combos}
+        for c in combos:
+            pool = combo_to_ids[c].copy()
+            random.shuffle(pool)
+            take = min(desired[c], len(pool))
+            selected_by_combo[c].extend(pool[:take])
+            pools[c] = pool[take:]
+
+        selected_count = sum(len(v) for v in selected_by_combo.values())
+        remaining = target - selected_count
+        while remaining > 0:
+            eligible = [c for c in combos if pools[c]]
+            if not eligible:
+                break
+            random.shuffle(eligible)
+            for c in eligible:
+                if remaining <= 0:
+                    break
+                selected_by_combo[c].append(pools[c].pop())
+                remaining -= 1
+
+        selected_ids = []
+        for c in combos:
+            selected_ids.extend(selected_by_combo[c])
+        random.shuffle(selected_ids)
+        selected_counts = {c: len(v) for c, v in selected_by_combo.items() if v}
+        total_counts = {c: len(v) for c, v in combo_to_ids.items()}
+        return selected_ids, selected_counts, total_counts
+
+    def _combo_text(combo_counts: dict, quota_cols: list[str]) -> str:
+        if not combo_counts:
+            return ""
+        parts = []
+        for combo, cnt in combo_counts.items():
+            label = ", ".join(f"{q}={v}" for q, v in zip(quota_cols, combo))
+            parts.append(f"[{label}]={cnt}")
+        return " | ".join(parts)
+
+    st.markdown("#### 5.4.1 — Set independent filter rules and requested counts")
+    saved_jobs = st.session_state.get("step54_jobs", [])
+    saved_by_col = {j.get("column"): j for j in saved_jobs}
+    with st.form("step5_4_independent_rules_form"):
+        st.write("Each column will be processed independently with its own filter and sample size.")
         jobs = []
+        op_opts = ["eq", "in", "mc", "nc"]
         for col in data_cols:
             st.markdown(f"**{col}**")
+            prev = saved_by_col.get(col, {})
+            default_op = prev.get("op", "eq")
+            default_op_idx = op_opts.index(default_op) if default_op in op_opts else 0
             op = st.selectbox(
                 f"{col} operator",
-                ["eq", "in", "mc", "nc"],
+                op_opts,
+                index=default_op_idx,
                 key=f"s54-op-{col}",
             )
-            vals = _allowed_vals(col)
+            vals = _allowed_vals(rt, col)
+            prev_vals = [int(x) for x in prev.get("values", [])]
             if op == "eq":
-                val = st.selectbox(f"{col} value", vals, key=f"s54-eq-{col}")
-                selected_vals = [int(val)] if val is not None else []
+                default_eq = prev_vals[0] if prev_vals else vals[0]
+                default_eq_idx = vals.index(default_eq) if default_eq in vals else 0
+                val = st.selectbox(f"{col} value", vals, index=default_eq_idx, key=f"s54-eq-{col}")
+                selected_vals = [int(val)]
             else:
+                default_multi = [x for x in prev_vals if x in vals]
                 selected_vals = st.multiselect(
                     f"{col} values",
                     vals,
+                    default=default_multi,
                     key=f"s54-vals-{col}",
                 )
                 selected_vals = [int(x) for x in selected_vals]
-
             sample_n = st.number_input(
                 f"{col} random respondent count",
                 min_value=0,
-                value=0,
+                value=int(prev.get("sample_n", 0)),
                 step=1,
                 key=f"s54-n-{col}",
             )
@@ -931,15 +1044,122 @@ def step5_independent_sampling():
                     "sample_n": int(sample_n),
                 }
             )
-        submitted = st.form_submit_button("Run independent filtering + random selection")
+        save_rules = st.form_submit_button("Save 5.4.1 settings")
+    if save_rules:
+        st.session_state["step54_jobs"] = jobs
+        st.success("Saved Step 5.4.1 settings.")
 
-    if submitted:
+    st.markdown("#### 5.4.2 — Add quota columns (optional)")
+    quota_current = st.session_state.get("step54_quota_cols", [])
+    quota_options = set(c for c in rt.columns if c != id_col)
+    if df_full is not None:
+        quota_options |= set(c for c in df_full.columns if c != id_col)
+    quota_options = sorted(quota_options)
+    picked_quota = st.multiselect(
+        "Quota columns for Step 5.4",
+        quota_options,
+        default=[c for c in quota_current if c in quota_options],
+        key="s54-quota-pick",
+    )
+    if st.button("Apply quota columns (5.4.2)"):
+        quota_cols = list(dict.fromkeys(picked_quota))
+        st.session_state["step54_quota_cols"] = quota_cols
+        current_defs = st.session_state.get("step54_bin_defs", {})
+        st.session_state["step54_bin_defs"] = {k: v for k, v in current_defs.items() if k in quota_cols}
+        st.success(f"Saved {len(quota_cols)} quota column(s) for Step 5.4.")
+
+    st.markdown("#### 5.4.3 — Customize bins for quota columns (optional)")
+    quota_cols = st.session_state.get("step54_quota_cols", [])
+    bin_defs_map = st.session_state.get("step54_bin_defs", {})
+    if not quota_cols:
+        st.info("No quota columns selected for Step 5.4.")
+    else:
+        st.caption(f"Current quota columns: {', '.join(quota_cols)}")
+        col_to_bin = st.selectbox("Quota column to bin (5.4.3)", quota_cols, key="s54-bin-col")
+        quota_preview = _build_quota_table(rt[id_col].dropna().drop_duplicates().tolist(), [col_to_bin])
+        vals = _allowed_vals(quota_preview, col_to_bin)
+        existing_defs = bin_defs_map.get(col_to_bin, [])
+        default_bins = len(existing_defs) if existing_defs else min(2, max(1, len(vals)))
+        num_bins = st.number_input(
+            "Number of bins",
+            min_value=1,
+            max_value=max(1, len(vals) if vals else 1),
+            value=int(default_bins),
+            step=1,
+            key=f"s54-num-bins-{col_to_bin}",
+        )
+        bin_defs = []
+        for i in range(int(num_bins)):
+            default_bin_vals = existing_defs[i] if i < len(existing_defs) else []
+            default_bin_vals = [x for x in default_bin_vals if x in vals]
+            sel = st.multiselect(
+                f"Bin {i+1} values",
+                vals,
+                default=default_bin_vals,
+                key=f"s54-bin-{col_to_bin}-{i}",
+            )
+            bin_defs.append(set(int(x) for x in sel))
+
+        apply_bins_clicked = st.button("Apply bins for selected quota column (5.4.3)")
+        clear_bins_clicked = st.button("Clear bins for selected quota column (5.4.3)")
+        if apply_bins_clicked:
+            used = set()
+            ok = True
+            cleaned_defs = []
+            for b in bin_defs:
+                if not b or (used & b):
+                    ok = False
+                    break
+                used |= b
+                cleaned_defs.append(sorted(b))
+            if not ok:
+                st.warning("Bins must be non-empty and non-overlapping.")
+            else:
+                new_defs = dict(bin_defs_map)
+                new_defs[col_to_bin] = cleaned_defs
+                st.session_state["step54_bin_defs"] = new_defs
+                st.success(f"Saved {len(cleaned_defs)} bin(s) for '{col_to_bin}'.")
+        if clear_bins_clicked:
+            if col_to_bin in bin_defs_map:
+                new_defs = dict(bin_defs_map)
+                new_defs.pop(col_to_bin, None)
+                st.session_state["step54_bin_defs"] = new_defs
+            st.success(f"Cleared bins for '{col_to_bin}'.")
+
+        current_defs = st.session_state.get("step54_bin_defs", {})
+        if current_defs:
+            st.caption("Current Step 5.4 bin definitions:")
+            for qcol, defs in current_defs.items():
+                show_text = ", ".join(f"Bin{i+1}:{d}" for i, d in enumerate(defs))
+                st.write(f"{qcol} -> {show_text}")
+
+    st.markdown("#### 5.4.4 — Run independent random selection (quota-aware if configured)")
+    if st.button("Run Step 5.4 selection"):
+        jobs_to_run = st.session_state.get("step54_jobs", [])
+        if not jobs_to_run:
+            st.session_state["step54_independent_samples"] = None
+            st.warning("Save 5.4.1 settings first.")
+            return
+
+        quota_cols = st.session_state.get("step54_quota_cols", [])
+        bin_defs_map = st.session_state.get("step54_bin_defs", {})
+        missing_quota = [
+            q for q in quota_cols
+            if q not in rt.columns and not (df_full is not None and q in df_full.columns and id_col in df_full.columns)
+        ]
+        active_quota_cols = [q for q in quota_cols if q not in missing_quota]
+
         out_rows = []
         notices = []
-        for job in jobs:
+        if missing_quota:
+            notices.append(
+                "Missing quota columns ignored: " + ", ".join(missing_quota)
+            )
+
+        for job in jobs_to_run:
             col = job["column"]
             op = job["op"]
-            vals = job["values"]
+            vals = [int(x) for x in job["values"]]
             sample_n = int(job["sample_n"])
 
             if sample_n <= 0:
@@ -951,6 +1171,11 @@ def step5_independent_sampling():
             conditions = [{"column": col, "op": op, "values": vals}]
             filtered_ids = select_ids_from_df(rt, conditions, respondent_col=id_col)
 
+            sampled_ids = []
+            combo_selected_txt = ""
+            combo_total_txt = ""
+            quota_mode = "No quota"
+
             if not filtered_ids:
                 sampled_ids = []
             elif sample_n >= len(filtered_ids):
@@ -959,6 +1184,17 @@ def step5_independent_sampling():
                     notices.append(
                         f"{col}: requested {sample_n}, but only {len(filtered_ids)} matched; returned all."
                     )
+                if active_quota_cols:
+                    quota_mode = "Quota configured (all matched returned)"
+            elif active_quota_cols:
+                qtbl = _build_quota_table(filtered_ids, active_quota_cols)
+                qtbl_binned = _apply_bins(qtbl, active_quota_cols, bin_defs_map)
+                sampled_ids, combo_sel, combo_total = _quota_aware_sample(
+                    qtbl_binned, active_quota_cols, sample_n
+                )
+                quota_mode = "Quota-aware balanced across combinations"
+                combo_selected_txt = _combo_text(combo_sel, active_quota_cols)
+                combo_total_txt = _combo_text(combo_total, active_quota_cols)
             else:
                 sampled_ids = random.sample(filtered_ids, sample_n)
 
@@ -970,6 +1206,9 @@ def step5_independent_sampling():
                     "Requested_n": sample_n,
                     "Matched_n": len(filtered_ids),
                     "Selected_n": len(sampled_ids),
+                    "Quota_mode": quota_mode,
+                    "Available_by_combo": combo_total_txt,
+                    "Selected_by_combo": combo_selected_txt,
                     "Selected_respondent_ids": sampled_ids,
                 }
             )
@@ -991,9 +1230,11 @@ def step5_independent_sampling():
         for _, row in result.iterrows():
             ids = row["Selected_respondent_ids"]
             st.write(
-                f"{row['Column']} | {row['Operator']} [{row['Values']}] -> "
-                f"{row['Selected_n']} ID(s)"
+                f"{row['Column']} | {row['Operator']} [{row['Values']}] | "
+                f"{row['Quota_mode']} -> {row['Selected_n']} ID(s)"
             )
+            if row["Selected_by_combo"]:
+                st.caption(f"Selected by combo: {row['Selected_by_combo']}")
             if ids:
                 st.code("\n".join(str(x) for x in ids), language="text")
             else:
