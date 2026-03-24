@@ -986,6 +986,15 @@ def step5_independent_sampling():
         total_counts = {c: len(v) for c, v in combo_to_ids.items()}
         return selected_ids, selected_counts, total_counts
 
+    def _combo_counts(df_ids_quota: pd.DataFrame, quota_cols: list[str]) -> dict:
+        if df_ids_quota.empty:
+            return {}
+        combo_series = df_ids_quota[quota_cols].apply(lambda row: tuple(row.tolist()), axis=1)
+        counts = {}
+        for combo in combo_series:
+            counts[combo] = counts.get(combo, 0) + 1
+        return counts
+
     def _combo_text(combo_counts: dict, quota_cols: list[str]) -> str:
         if not combo_counts:
             return ""
@@ -1155,6 +1164,11 @@ def step5_independent_sampling():
             notices.append(
                 "Missing quota columns ignored: " + ", ".join(missing_quota)
             )
+        notices.append(
+            "Step 5.4 non-dup goal: each next column tries to avoid IDs already selected by previous columns."
+        )
+
+        used_ids_global = set()
 
         for job in jobs_to_run:
             col = job["column"]
@@ -1170,16 +1184,21 @@ def step5_independent_sampling():
 
             conditions = [{"column": col, "op": op, "values": vals}]
             filtered_ids = select_ids_from_df(rt, conditions, respondent_col=id_col)
+            filtered_set = set(filtered_ids)
+            fresh_ids = [rid for rid in filtered_ids if rid not in used_ids_global]
+            reused_pool_ids = [rid for rid in filtered_ids if rid in used_ids_global]
 
             sampled_ids = []
             combo_selected_txt = ""
             combo_total_txt = ""
             quota_mode = "No quota"
+            reused_from_previous = 0
 
             if not filtered_ids:
                 sampled_ids = []
             elif sample_n >= len(filtered_ids):
                 sampled_ids = list(filtered_ids)
+                reused_from_previous = sum(1 for rid in sampled_ids if rid in used_ids_global)
                 if sample_n > len(filtered_ids):
                     notices.append(
                         f"{col}: requested {sample_n}, but only {len(filtered_ids)} matched; returned all."
@@ -1187,16 +1206,54 @@ def step5_independent_sampling():
                 if active_quota_cols:
                     quota_mode = "Quota configured (all matched returned)"
             elif active_quota_cols:
-                qtbl = _build_quota_table(filtered_ids, active_quota_cols)
-                qtbl_binned = _apply_bins(qtbl, active_quota_cols, bin_defs_map)
-                sampled_ids, combo_sel, combo_total = _quota_aware_sample(
-                    qtbl_binned, active_quota_cols, sample_n
-                )
+                sampled_fresh = []
+                if fresh_ids:
+                    qtbl_fresh = _build_quota_table(fresh_ids, active_quota_cols)
+                    qtbl_fresh_binned = _apply_bins(qtbl_fresh, active_quota_cols, bin_defs_map)
+                    sampled_fresh, _, _ = _quota_aware_sample(
+                        qtbl_fresh_binned, active_quota_cols, sample_n
+                    )
+                remaining = sample_n - len(sampled_fresh)
+                sampled_reused = []
+                if remaining > 0 and reused_pool_ids:
+                    qtbl_reused = _build_quota_table(reused_pool_ids, active_quota_cols)
+                    qtbl_reused_binned = _apply_bins(qtbl_reused, active_quota_cols, bin_defs_map)
+                    sampled_reused, _, _ = _quota_aware_sample(
+                        qtbl_reused_binned, active_quota_cols, remaining
+                    )
+                sampled_ids = sampled_fresh + sampled_reused
+                random.shuffle(sampled_ids)
+                reused_from_previous = len(sampled_reused)
                 quota_mode = "Quota-aware balanced across combinations"
-                combo_selected_txt = _combo_text(combo_sel, active_quota_cols)
-                combo_total_txt = _combo_text(combo_total, active_quota_cols)
+                qtbl_all = _build_quota_table(filtered_ids, active_quota_cols)
+                qtbl_all_binned = _apply_bins(qtbl_all, active_quota_cols, bin_defs_map)
+                qtbl_selected = _build_quota_table(sampled_ids, active_quota_cols)
+                qtbl_selected_binned = _apply_bins(qtbl_selected, active_quota_cols, bin_defs_map)
+                combo_total_txt = _combo_text(_combo_counts(qtbl_all_binned, active_quota_cols), active_quota_cols)
+                combo_selected_txt = _combo_text(_combo_counts(qtbl_selected_binned, active_quota_cols), active_quota_cols)
+                if reused_from_previous > 0:
+                    notices.append(
+                        f"{col}: reused {reused_from_previous} previously selected ID(s) because unique IDs were insufficient."
+                    )
             else:
-                sampled_ids = random.sample(filtered_ids, sample_n)
+                if len(fresh_ids) >= sample_n:
+                    sampled_ids = random.sample(fresh_ids, sample_n)
+                    reused_from_previous = 0
+                else:
+                    sampled_ids = fresh_ids.copy()
+                    random.shuffle(sampled_ids)
+                    need = sample_n - len(sampled_ids)
+                    fallback = random.sample(reused_pool_ids, need) if need > 0 else []
+                    sampled_ids.extend(fallback)
+                    random.shuffle(sampled_ids)
+                    reused_from_previous = len(fallback)
+                    if reused_from_previous > 0:
+                        notices.append(
+                            f"{col}: reused {reused_from_previous} previously selected ID(s) because unique IDs were insufficient."
+                        )
+
+            sampled_ids = [rid for rid in sampled_ids if rid in filtered_set]
+            used_ids_global.update(sampled_ids)
 
             out_rows.append(
                 {
@@ -1206,6 +1263,7 @@ def step5_independent_sampling():
                     "Requested_n": sample_n,
                     "Matched_n": len(filtered_ids),
                     "Selected_n": len(sampled_ids),
+                    "Reused_from_previous_cols": reused_from_previous,
                     "Quota_mode": quota_mode,
                     "Available_by_combo": combo_total_txt,
                     "Selected_by_combo": combo_selected_txt,
@@ -1231,7 +1289,7 @@ def step5_independent_sampling():
             ids = row["Selected_respondent_ids"]
             st.write(
                 f"{row['Column']} | {row['Operator']} [{row['Values']}] | "
-                f"{row['Quota_mode']} -> {row['Selected_n']} ID(s)"
+                f"{row['Quota_mode']} -> {row['Selected_n']} ID(s), reused={row['Reused_from_previous_cols']}"
             )
             if row["Selected_by_combo"]:
                 st.caption(f"Selected by combo: {row['Selected_by_combo']}")
